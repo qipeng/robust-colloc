@@ -22,6 +22,7 @@ def process_sent(s):
         idx -= 1
 
     s = s[:(idx+1)] + " " + s[(idx+1):]
+    s = "<s> " + s + " </s>"
     return s
 
 counter = 0
