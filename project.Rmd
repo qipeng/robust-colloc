@@ -58,15 +58,17 @@ conditional[1:10]
 
 ```{r}
 draw.sample<-function(conditional,l,size) {
-new<-rep(0,size)
-new[1]<-1
+  new<-rep(0,size)
+  new[1]<-1
 
-for(i in 2:size) {
-p<-conditional[idxlookup[new[i-1],]]
-x<-which(idxlookup[new[i-1],] > 0, arr.ind = T)
-new[i]<-sample(x,1,prob=p)
-}
-return(new)
+  for(i in 2:size) {
+    p<-conditional[idxlookup[new[i-1],]]
+    x<-which(idxlookup[new[i-1],] > 0, arr.ind = T)
+    
+    idx = sample.int(length(p), size = 1, prob=p)
+    new[i] = x[idx]
+  }
+  return(new)
 }
 
 newsample<-draw.sample(conditional,l,10000)
