@@ -146,7 +146,12 @@ draw.alias = function(keyi) {
   JJ = J[[keyi]]
   qq = q[[keyi]]
   K = length(xx)
-  k = sample.int(K, 1)
+  k = ceiling(runif(1) * K)
+  if (k == 0) {
+    k = 1
+  } else if (k > length(qq)) {
+    k = length(qq)
+  }
   if (runif(1) >= qq[k]) {
     return(xx[JJ[k]])
   } else {
@@ -161,7 +166,7 @@ Important functions:
 * `PMI`, `PMIsq`, and `NMPI` implements point-wise mutual information, a modified PMI$^2$, and NPMI, respectively.
 ```{r}
 draw.sample<-function(conditional,size,RNG=.Random.seed) {
-  # parallel doesn't like cross-interferring random streams, so we set the random stream for each worker separately
+  # for parallel
   set.seed(RNG)
   
   new<-rep(0,size)
@@ -253,26 +258,166 @@ print(sprintf('The perplexity of the MLE language model is: %f', ppl))
 ```
 Finally, run bootstrap!
 ```{r}
+library(parallel)
+Nshards = 25
+SAMPLES = 8
+CORES = 8
+N = Nshards * SAMPLES
+
+# set up RNGs
+RNGkind("L'Ecuyer-CMRG")
+
+RNGS = list()
+s = .Random.seed
+for (i in 1:N) {
+  s = nextRNGSubStream(s)
+  RNGS[[i]] = s
+}
+
+# 500, RNGS[[i + (shard - 1) * SAMPLES]]
+
+for (shard in 1:Nshards) {
+  filename = sprintf('bootstrap.part%d.RData', shard)
+  if (!file.exists(filename)) {
+    bootstrap_res = mclapply(1:SAMPLES, function(i) PMIfamily(c(PMI, PMIsq, NPMI), draw.sample(conditional, length(corpus), RNGS[[i + (shard - 1) * SAMPLES]]),V,idxlookup,IJ), mc.cores = CORES)
+    save(bootstrap_res, file = filename)
+  }
+}
+```
+Collect statistics from bootstrap samples.
+```{r}
 if (file.exists('bootstrap.RData')) {
   load('bootstrap.RData')
 } else {
-  library(parallel)
+  bootstrap_results = list()
+  for (shard in 1:Nshards) {
+    filename = sprintf('bootstrap.part%d.RData', shard)
+    load(filename)
+    bootstrap_results[[length(bootstrap_results) + 1]] = bootstrap_res
+  }
+  bootstrap_results = simplify2array(bootstrap_results)
   
-  CORES = 8
-  SAMPLES = 200
+  N = Nshards * SAMPLES
+  I = dim(bootstrap_results[[1]])[1]
+  J = dim(bootstrap_results[[1]])[2]
   
-  # set up RNGs
-  RNGkind("L'Ecuyer-CMRG")
-  set.seed(31415)
-  ## start M workers
-  s <- .Random.seed
-  RNG = list()
-  for (i in 1:SAMPLES) {
-    s <- nextRNGStream(s)
-    RNG[[i]] = s
+  bootstrap_res_mat = matrix(0, N, I * J)
+  for (i in 1:N) {
+    bootstrap_res_mat[i,] = bootstrap_results[[i]]
   }
   
-  bootstrap_res = simplify2array(mclapply(1:SAMPLES, function(i) PMIfamily(c(PMI, PMIsq, NPMI), draw.sample(conditional, length(corpus), RNG[[i]]),V,idxlookup,IJ), mc.cores = CORES))
-  save(bootstrap_res, file = "bootstrap.RData")
+  npairs = I
+  nstats = J
+  
+  # replace NaNs with null
+  for (istat in 1:nstats) {
+    stat_name = stat_names[istat]
+    if (stat_name == 'PMI') {
+      for (col in (istat-1) * npairs + (1:npairs)) {
+        bootstrap_res_mat[is.nan(bootstrap_res_mat[,col]),col] = 0
+      }
+    } else if (stat_name == 'PMI^2*') {
+      for (col in (istat-1) * npairs + (1:npairs)) {
+        bootstrap_res_mat[is.nan(bootstrap_res_mat[,col]),col] = 1
+      }
+    } else if (stat_name == 'NPMI') {
+      for (col in (istat-1) * npairs + (1:npairs)) {
+        bootstrap_res_mat[is.nan(bootstrap_res_mat[,col]),col] = 0
+      }
+    }
+  }
+  
+  save(N, I, J, bootstrap_res_mat, npairs, nstats, file = 'bootstrap.RData')
 }
+
+alpha = .95   # Confidence level
+
+if (file.exists('bootstrap.stats.RData')) {
+  load('bootstrap.stats.RData')
+} else {
+  statistics = apply(bootstrap_res_mat, 2, function(x) c(mean(x), quantile(x, probs = c((1-alpha)/2, (1+alpha)/2))))
+  meanstat = statistics[1,]
+  CIlow = statistics[2,]
+  CIhigh = statistics[3,]
+  
+  meanstat = matrix(meanstat, I, J)
+  CIlow = matrix(CIlow, I, J)
+  CIhigh = matrix(CIhigh, I, J)
+  
+  rejectedLow = CIlow
+  rejectedLow[,1] = (rejectedLow[,1] <= 0)
+  rejectedLow[,2] = (rejectedLow[,2] <= 1)
+  rejectedLow[,3] = (rejectedLow[,3] <= 0)
+  rejectedHigh = CIhigh
+  rejectedHigh[,1] = (rejectedHigh[,1] >= 0)
+  rejectedHigh[,2] = (rejectedHigh[,2] >= 1)
+  rejectedHigh[,3] = (rejectedHigh[,3] >= 0)
+  rejected = rejectedLow & rejectedHigh
+  
+  save(meanstat, CIlow, CIhigh, rejected, file = 'bootstrap.stats.RData')
+}
+```
+Present statstics (for LaTeX)
+```{r, echo = FALSE}
+topN = 10
+rndN = 30
+randidx = sample.int(I, rndN)
+
+printTopN = function(res) {
+  topIdx = matrix(0, topN, J)
+  for (j in 1:J) {
+    ranked = simplify2array(sort.int(res[,j], decreasing = (j!=2), index.return = T)$ix)
+    topIdx[1:topN,j] = ranked[1:topN]
+  }
+  for (i in 1:topN) {
+    score1 = sprintf('%.2f', res[topIdx[i,1],1])
+    score2 = sprintf('%.2f', res[topIdx[i,2],2])
+    score3 = sprintf('%.2f', res[topIdx[i,3],3])
+    
+    print(sprintf("%d & %s %s & %s & %s %s & %s & %s %s & %s \\",
+                  i, map[IJ[topIdx[i,1],2],2], map[IJ[topIdx[i,1],1],2], score1, 
+                  map[IJ[topIdx[i,2],2],2], map[IJ[topIdx[i,2],1],2], score2,
+                  map[IJ[topIdx[i,3],2],2], map[IJ[topIdx[i,3],1],2], score3))
+  }
+}
+
+printRand = function(res, res2 = NULL, rejected = NULL) {
+  for (i in 1:rndN) {
+    if (!is.null(res2)) {
+      score1 = sprintf('[%.2f,%.2f]', res[randidx[i],1], res2[randidx[i],1])
+      score2 = sprintf('[%.2f,%.2f]', res[randidx[i],2], res2[randidx[i],2])
+      score3 = sprintf('[%.2f,%.2f]', res[randidx[i],3], res2[randidx[i],3])
+      if (!is.null(rejected)) {
+        if (!rejected[randidx[i],1]) {
+          score1 = sprintf('\\textbf{%s}', score1)
+        }
+        if (!rejected[randidx[i],2]) {
+          score2 = sprintf('\\textbf{%s}', score2)
+        }
+        if (!rejected[randidx[i],3]) {
+          score3 = sprintf('\\textbf{%s}', score3)
+        }
+      }
+    } else {
+      score1 = sprintf('%.2f', res[randidx[i],1])
+      score2 = sprintf('%.2f', res[randidx[i],2])
+      score3 = sprintf('%.2f', res[randidx[i],3])
+    }
+    
+    print(sprintf("%s %s & %s & %s & %s \\",
+                  map[IJ[randidx[i],2],2], map[IJ[randidx[i],1],2], 
+                  score1, score2, score3))
+  }
+}
+
+print("Table 1")
+printTopN(vanilla_res)
+print("Table 2")
+printRand(vanilla_res)
+print("Table 3")
+meanstat1 = meanstat
+meanstat1[rejected] = 0
+printTopN(meanstat1)
+print("Table 4")
+printRand(CIlow, CIhigh, rejected)
 ```
